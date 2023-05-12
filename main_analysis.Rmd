@@ -1,0 +1,819 @@
+---
+title: "Elucidation of B-cell Function in Aplastic Anemia Through Single-cell RNA-Seq of Bone Marrow Tissue"
+author: "Kevin Liu"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    keep_tex: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# load all necessary libraries
+library(Seurat)
+library(data.table)
+library(Matrix)
+library(tidyverse)
+library(harmony)
+library(fgsea)
+library(msigdbr)
+library(patchwork)
+library(viridis)
+```
+
+# Preparation and Data Pre-processing
+
+In this section, we will load in the data, create a Seurat object, and perform quality control (QC) of our scRNA-seq dataset from Tonglin et al. (2022) that were collected from two cases with aplastic anemia (AA) and non-AA controls [1].
+
+## Loading data and creating Seurat object
+
+First, we will create the Seurat object using the supplied counts and metadata.
+
+```{r mk_obj}
+# read in dataset components
+counts = readRDS("project_data/Tonglin2022_AnemiaBM/counts.rds") # counts data
+metadata = readRDS("project_data/Tonglin2022_AnemiaBM/meta.data.rds") # metadata
+
+sc_obj = CreateSeuratObject(counts = counts, meta.data = metadata) # create Seurat object
+
+# cleanup R environment and free up RAM
+rm(counts, metadata)
+gc()
+```
+
+## Quality Control (QC) and Batch Correction of scRNA-seq Dataset
+
+To perform QC on our dataset, we will begin by determining the percentage of mitochondrial UMIs per cell and store it as a feature; the relevant QC metrics will then be visualized; finally, we will QC the dataset and re-visualize the metrics as a sanity check. For batch correction, we will first identify the top features (genes) with the largest positive and negative weights on PC1 and also compute and plot the PCA and UMAP to assess the potential for batch effects that should be corrected via harmony.
+
+### Visualization of QC Metrics
+
+Lets begin by plotting the distribution of UMI count per cell and percent of mitochondrial UMIs, looking at the overall distribution, as well as by disease status and sample; the number of molecules detected within a cell will also be visualized.
+
+```{r qc_vln_plot_pre, fig.height=6}
+# calculate % mitochondrial UMIs per cell and store as feature for QC
+sc_obj[["Percent_mito"]] = PercentageFeatureSet(sc_obj, pattern = "^MT-")
+
+# plot distributions of QC metrics both overall and by disease/sample
+# note: we are not using Seurat's VlnPlot() here for customization reasons
+vln_plt_features = c("nFeature_RNA", "nCount_RNA", "Percent_mito")
+  
+plot_qc_metrics = function(plt_title){(sc_obj@meta.data %>% 
+  pivot_longer(cols = all_of(vln_plt_features)) %>% 
+  ggplot(aes(x = name, y = value, fill = name)) +
+  geom_violin() +
+  geom_jitter(alpha = 0.1, shape = 1, size = 0.01) +
+  facet_wrap(~name, drop = TRUE, scales = "free", ncol = 1, 
+             strip.position = "left") +
+  labs(x = "", y = "", title = "Overall") +
+  theme_bw() +
+  theme(aspect.ratio = 1.25, legend.position = "none",
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 9),
+        strip.placement = "outside", strip.background = element_blank(),
+        strip.text = element_text(face = "bold"),
+        axis.text.x = element_blank(), axis.ticks.x = element_blank())) +
+  (sc_obj@meta.data %>% 
+  pivot_longer(cols = all_of(vln_plt_features)) %>% 
+  ggplot(aes(x = disease, y = value, fill = disease)) +
+  geom_violin() +
+  geom_jitter(alpha = 0.1, shape = 1, size = 0.01) +
+  facet_wrap(~name, drop = TRUE, scales = "free", ncol = 1) +
+  labs(x = "", y = "", title = "Grouped by Disease Status") +
+  theme_bw() +
+  theme(aspect.ratio = 1.25, legend.position = "none", 
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 9),
+        strip.background = element_blank(), strip.text.x = element_blank())) +
+  (sc_obj@meta.data %>% 
+  pivot_longer(cols = all_of(vln_plt_features)) %>% 
+  ggplot(aes(x = sample, y = value, fill = sample)) +
+  geom_violin() +
+  geom_jitter(alpha = 0.1, shape = 1, size = 0.01) +
+  facet_wrap(~name, drop = TRUE, scales = "free", ncol = 1) +
+  labs(x = "", y = "", title = "Grouped by Sample") +
+  theme_bw() +
+  theme(aspect.ratio = 1.25, legend.position = "none", 
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 9),
+        strip.background = element_blank(), strip.text.x = element_blank())) +
+  plot_annotation(title = plt_title, 
+                  theme = theme(plot.title = element_text(hjust = 0.5, 
+                                                          face = "bold")))}
+
+qc_vln_plot_pre = plot_qc_metrics("QC Metrics (Pre-QC)")
+
+qc_vln_plot_pre # plot it
+```
+
+Observing the above violin plots, the most striking observation is that there are a number of cells with high (> 20%) percent of mitochondrial UMIs, which is mostly observed in the anemia group but is still apparent across all samples; we further observe that most cells appear to have less than 10% of mitochondrial UMIs, which may suggest that there are low quality cells in our dataset and could be an indicator of droplets in the respective samples not containing the expected gene expression profile of a normal functioning cell. We may further speculate that these observations are likely a result of a significant proportion of dead or dying cells or ambient RNA within the droplets. We will address this in the QC step by applying a more stringent threshold on the percent of mitochondrial UMIs.
+
+### Biological Considerations for QC
+
+Prior to conducting QC, we will attempt to define and justify thresholds for the filtering of cells from our dataset. We will first perform the pre-processing steps of normalization, feature selection, and scaling. Subsequently, we will run PCA, determine the optimal number of meaningful PCs to include from dimensionality reduction using both an elbow plot and by running JackStraw to ensure the best choice, and compute the UMAP based on the determined number of dimensions. We will then plot the UMAP and assess for the presence of expected cell-types, namely platelets and hematopoietic stem cells (HSCs) that were identified in the original paper by Tonglin et al. [1], for bone marrow tissue within the 2-dimensional plot using select genes from a cell atlas that is compiled and integrated into Azimuth [2] and listed on their webpage. We will then attempt to identify appropriate QC metric thresholds from the relevant plots with the aim to retain the expected cells from the bone marrow tissue while removing any potential low quality cells.
+
+```{r init_preprocess}
+# log-normalize and scale counts to 10k
+sc_obj = NormalizeData(sc_obj, normalization.method = "LogNormalize", scale.factor = 10000)
+
+# find top 2k variable genes via vst
+sc_obj = FindVariableFeatures(sc_obj, selection.method = "vst", nfeatures = 2000)
+
+# scale and center to mean of 0 and var of 1
+sc_obj = ScaleData(sc_obj, do.scale = TRUE, do.center = TRUE)
+
+# run PCA
+sc_obj = RunPCA(sc_obj)
+
+# elbow plot to determine optimal number of PCs
+ElbowPlot(sc_obj, ndims = 50, reduction = "pca") + # plot elbow plot using 50 total dimensions
+  geom_vline(xintercept = 35, color = "red", linetype = "dashed") # chose 35 PCs as the inflection point
+
+# since the elbow method does not provide a clear cutoff, we will also run JackStraw
+sc_obj = JackStraw(sc_obj, num.replicate = 100, dims = 40)
+sc_obj = ScoreJackStraw(sc_obj, dims = 1:40)
+JackStrawPlot(sc_obj, dims = 1:30)
+```
+
+As shown above, we observe the inflection point occurring at roughly PC 35 using the elbow plot; however, the inflection point is very unclear in our scenario. Therefore, we will rely on the Jackstraw plot, which gives a significant drop in p-value at PC 26; thus, we will use 26 PCs for computing our UMAP in subsequent steps.
+
+As previously mentioned, Tonglin et al. (2022) identified 8 broad cell-type clusters based on their dataset following QC [1]; here, we will select marker genes for HSCs and platelets based on the listed marker genes from the cell atlas used in Azimuth [2-5] to elucidate the optimal thresholds for the QC metrics we will apply in subsequent steps. Among the list of marker genes, we will use the PPBP gene, which is highly specific to platelets and almost exclusively expressed in the bone marrow [6], and CDK6, a protein kinase involved in cellular differentiation that is expressed in HSCs [6], for our elucidation of the QC thresholds.
+
+```{r qc_umap}
+# run and plot PCA and UMAP (first 35 dimensions)
+sc_obj = RunUMAP(sc_obj, dims = 1:26, 
+                 reduction = "pca", 
+                 reduction.name = "PreQC_umap",
+                 reduction.key = "UMAP_")
+
+# define vector of genes for platelets and HSCs from Azimuth [2-5]
+platelet_markers = c("RGS18", "C2orf88", "TMEM40", "GP9", "PF4", "PPBP", "DAB2", "SPARC", "RUFY1", "F13A1")
+hsc_markers = c("SPINK2", "SOX4", "FAM30A", "CDK6", "AC084033.3", "SMIM24", "STMN1", "PRSS57", "MEF2C", "IGLL1")
+
+# select two for plotting UMAP; PPBP for platelets and CDK6 for HSCs [6]
+platelet_hsc_markers = c("PPBP", "CDK6")
+
+FeaturePlot(sc_obj, features = platelet_hsc_markers, reduction = "PreQC_umap", ncol = 2) & NoLegend()
+
+(((FeatureScatter(sc_obj, feature1 = "PPBP", feature2 = "nFeature_RNA", pt.size = 0.1)  + 
+  geom_hline(yintercept = 6000) + geom_hline(yintercept = 200) + ggtitle("")) |
+  (FeatureScatter(sc_obj, feature1 = "CDK6", feature2 = "nFeature_RNA", pt.size = 0.1) + 
+  geom_hline(yintercept = 6000) + geom_hline(yintercept = 200) + ggtitle(""))) /
+  ((FeatureScatter(sc_obj, feature1 = "PPBP", feature2 = "Percent_mito", pt.size = 0.1) + 
+  geom_hline(yintercept = 10) + ggtitle("")) |
+  (FeatureScatter(sc_obj, feature1 = "CDK6", feature2 = "Percent_mito", pt.size = 0.1) + 
+  geom_hline(yintercept = 10) + ggtitle("")))) & NoLegend()
+```
+
+Based on the above plots, we observe the unique expression of the PPBP and CDK6 in cells found in identifiable clusters on the UMAP, which we will use as a baseline for our QC. The subsequent scatter plots of percent mitochondrial UMIs and number of UMIs per cell against the expression levels of PPBP and CDK6 within our cells suggest that using upper bounds of 6000 UMI counts/cell and lower bounds of 200 UMI counts/cell, as well as a 10% mitochondrial UMI upper bound, is reasonable to retain nearly all of the platelets and HSCs.
+
+### Perform QC
+
+Now that we have identified the appropriate QC thresholds, we will clear the original Seurat object and re-load the data to ensure that the previous data processing steps will not affect our final dataset used for formal analysis. We can then perform QC by filtering out the cells that have a percent mitochondrial UMI that is greater than 10%, which is consistent with the original methodology by Tonglin et al. [1] We will also remove any cells that have a UMI count less than or equal to 200 to remove any potential dead or dying cells and empty droplets and any cells with UMI counts greater than or equal to 6000, which are likely due to doublets or multiplets. These numbers were derived from the previous analysis.
+
+```{r QC, fig.height=6}
+rm(sc_obj) # remove previous sc_obj
+
+# read in dataset components
+counts = readRDS("project_data/Tonglin2022_AnemiaBM/counts.rds") # counts data
+metadata = readRDS("project_data/Tonglin2022_AnemiaBM/meta.data.rds") # metadata
+
+sc_obj = CreateSeuratObject(counts = counts, meta.data = metadata) # re-create Seurat object
+
+# cleanup R environment
+rm(counts, metadata)
+
+# calculate % mitochondrial UMIs per cell and store as feature for QC
+sc_obj[["Percent_mito"]] = PercentageFeatureSet(sc_obj, pattern = "^MT-")
+
+n_cells_pre_qc = dim(sc_obj)[2] # store number of cells from pre-QC data
+
+# plot number of UMIs and % mitochondrial UMIs, annotate cells to remove based on QC, 
+# colored by sample and shaded by regioon to exclude cells
+ggplot(sc_obj@meta.data, aes(x = nFeature_RNA, y = Percent_mito)) + 
+  geom_rect(xmin = 0, xmax = Inf, ymin = 10, ymax = Inf, fill = "pink", alpha = 0.025) +
+  geom_rect(xmin = 0, xmax = 200, ymin = 0, ymax = Inf, fill = "pink", alpha = 0.025) +
+  geom_rect(xmin = 6000, xmax = Inf, ymin = 0, ymax = Inf, fill = "pink", alpha = 0.025) +
+  geom_point(aes(color = sc_obj$sample), alpha = 0.5) +
+  geom_vline(xintercept = 6000, color = "red", linetype = "dashed") + # upper bounds for UMI count/cell
+  geom_vline(xintercept = 200, color = "red", linetype = "dashed") + # lower bounds for UMI count/cell
+  geom_hline(yintercept = 10, color = "red", linetype = "dashed") + # upper bounds for % MT UMI
+  theme_bw() +
+  labs(x = "UMI counts per cell", y = "Percent mitochondrial UMI", color = "Sample", 
+       caption = str_c("Pre-QC filtering by % mitochondrial UMI and UMI count per cell: ", 
+                       dim(sc_obj)[2], 
+                       " cells.\nPink shaded region represents cells to be removed during QC."),
+       title = "Determined QC Thresholds") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.caption = element_text(hjust = 0))
+
+# remove the cells based on thresholds determined from plot
+sc_obj = subset(sc_obj, subset = nFeature_RNA > 200 & 
+                  nFeature_RNA < 6000 & 
+                  Percent_mito < 10)
+
+n_cells_post_qc = dim(sc_obj)[2] # store number of cells after QC
+
+# calculate % cells removed during QC
+prop_cells_removed = abs(((n_cells_post_qc - n_cells_pre_qc) / n_cells_pre_qc))
+
+# re-plot to show post-QC cell distribution by number of UMIs and % mitochondrial UMIs, 
+ggplot(sc_obj@meta.data, aes(x = nFeature_RNA, y = Percent_mito)) + 
+  geom_point(aes(color = sc_obj$sample), alpha = 0.5) +
+  theme_bw() +
+  labs(x = "UMI counts per cell", y = "Percent mitochondrial UMI", color = "Sample", 
+       caption = str_c("Post-QC filtering by % mitochondrial UMI and UMI count per cell: ", 
+                       dim(sc_obj)[2], " cells.\n", 
+                       signif(prop_cells_removed*100, 4), "% of cells were removed during QC."),
+       title = "Remaining Cells Post-QC") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.caption = element_text(hjust = 0))
+
+print(str_c(signif(prop_cells_removed, 4)*100, "% of cells were removed during QC and ", n_cells_post_qc, " cells remained in the dataset."))
+
+# plot distributions of QC metrics after QC for both overall and by disease/sample
+qc_vln_plot_post = plot_qc_metrics("QC Metrics (Post-QC)")
+qc_vln_plot_post
+```
+
+After QC using the thresholds as previously mentioned, we see that we have removed 9.229% of cells and 21499 cells remained, which is fairly close to the 20419 cells that the original paper retained after QC [1]. 
+
+### Post-QC Data Processing
+
+Next, we will re-perform the data processing steps of normalization, feature selection, and scaling. We will first log-normalize the data and scale the counts to 10,000; this is followed by identifying the top 2000 most variable features (genes) using the 'vst' method and scaling the features to a standard normal distribution with a mean of 0 and a variance of 1, which makes the features comparable on the same scale. Since we have previously determined the number of PCs to work with via JaackStraw, we will simply run PCA and use the first 26 PCs to compute the UMAP for subsequent analyses.
+
+```{r preprocess}
+# log-normalize and scale counts to 10k
+sc_obj = NormalizeData(sc_obj, normalization.method = "LogNormalize", scale.factor = 10000)
+
+# find top 2k variable genes via vst
+sc_obj = FindVariableFeatures(sc_obj, selection.method = "vst", nfeatures = 2000)
+
+# scale and center to mean of 0 and var of 1
+sc_obj = ScaleData(sc_obj, do.scale = TRUE, do.center = TRUE)
+
+# run PCA
+sc_obj = RunPCA(sc_obj)
+```
+
+### Identification of Potential Variables Associated with Batch Effects
+
+We will compute and visualize the PCA and UMAP plots pre-batch correction to assess for any undesirable sources of variation that should be batch corrected.
+
+```{r viz_preBatchCorr, fig.asp=2}
+# run and plot PCA and UMAP (first 50 dimensions)
+sc_obj = RunUMAP(sc_obj, dims = 1:26, 
+                 reduction = "pca", 
+                 reduction.name = "pre_batchcorr_umap",
+                 reduction.key = "PreBatchCorrectionUMAP_")
+
+pre_batchcorr_umap = DimPlot(sc_obj, group.by = c("sample", "disease"), 
+                             reduction = "pre_batchcorr_umap", combine = FALSE)
+
+pre_batchcorr_wrap = wrap_plots(lapply(pre_batchcorr_umap, function(x){
+  x + 
+    labs(subtitle = "Pre-batch correction") + 
+    theme(plot.title = element_text(size = 10, face = "plain", hjust = 0.5, vjust = -7),
+          plot.subtitle = element_text(size = 10, face = "bold", hjust = 0.5, vjust = 10),
+          axis.title.x = element_text(size = 10),
+          axis.title.y = element_text(size = 10))}), 
+                                nrow = 2, ncol = 1) +
+  labs(subtitle = "") +
+  plot_annotation(title = "Pre-batch Correction UMAP (first 35 dimensions)",
+                  theme = theme(plot.title = element_text(hjust = 0.5, face = "bold")))
+
+pre_batchcorr_wrap
+```
+
+Based on the above UMAP plots, we see that there is minimal mixing of cells in the UMAP clusters using either of the grouping variables. This may lead us to consider using "sample" as a batch variable for batch correction, since each subject's sample could have minor technical variations that are undesirable for our subsequent analysis; here, we do not expect that disease status would contribute to any technical variations to our data in addition to the avoidance of potentially removing any biologically meaningful differences and thus we will not use it for batch correction.
+
+### Correction of Batch Effects
+
+Since we observed minimal mixing between cell clusters in the UMAPs post-QC, we will use harmony to correct for batch effects due to the "sample" feature, which is a feature that we had speculated to be a batch variable. We will also re-compute and plot the UMAP after batch correction and compare it to the pre-batch corrected UMAP to see if there is improved mixing within the observed cell clusters.
+
+```{r batch_correction, fig.asp=1}
+# perform batch correction using sample as batch variable
+sc_obj = RunHarmony(sc_obj, "sample", reduction = "pca")
+
+# compute and plot the pre- and post-harmony UMAP and re-assess for platelets and HSCs
+sc_obj = RunUMAP(sc_obj, dims = 1:26, reduction = "harmony",
+                 reduction.name = "umap_harmony",
+                 reduction.key = "harmonyUMAP_")
+
+batch_corr_umap = DimPlot(sc_obj, reduction = "umap_harmony",
+                          group.by = c("sample", "disease"), combine = FALSE)
+
+batchcorr_wrap = wrap_plots(lapply(batch_corr_umap, function(x){
+  x +
+    labs(subtitle = "Post-batch correction") +
+    theme(plot.title = element_text(size = 10, face = "plain", hjust = 0.5, vjust = -7),
+          plot.subtitle = element_text(size = 10, face = "bold", hjust = 0.5, vjust = 10),
+          axis.title.x = element_text(size = 10),
+          axis.title.y = element_text(size = 10))}),
+  nrow = 2, ncol = 1) +
+  labs(subtitle = "")
+
+batchcorr_umap_wrap = (pre_batchcorr_wrap | batchcorr_wrap) +
+  plot_annotation(title = "Comparison of UMAP Plots Before and After Batch Correction",
+                  theme = theme(plot.title = element_text(hjust = 0.5, face = "bold"))) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "right")
+
+batchcorr_umap_wrap
+```
+
+```{r bio_umap, fig.asp=0.5}
+# plot the two cell-type markers
+(FeaturePlot(sc_obj, features = platelet_hsc_markers, reduction = "umap_harmony") & 
+    NoLegend())
+```
+
+Upon examining the post-batch corrected UMAPa, we observe that there is an expected improvement in mixing within the cell clusters when colored by both disease status and sample number, suggesting that the batch correction was effective in removing undesirable technical variations in our dataset; however, we also see that the cell-type markers for HSCs and platelets are more scattered than when examined prior to batch correction, which suggests that the batch correction procedure may have disrupted some of the biological variation in our data. Nonetheless, this concludes our QC and batch correction steps and we will continue on to cluster our cells by cell-types.
+
+# Clustering of Cell Types
+
+Based on the original paper by Tonglin et al., the authors identified 8 broad cell-types using t-SNE based on differential gene expression analysis [1] (see [Figure 1c](https://www.frontiersin.org/articles/10.3389/fgene.2021.745483/full#F1)). Here, we will first perform the cell-type clustering, then attempt to manually annotate the cell-types for each cluster based on the differentially expressed genes using a one-against-all approach. We will subsequently refine or complete our annotations with an automated cluster annotation tool, Azimuth [2].
+
+## Identification of Optimal Clustering Resolution and Cluster Visualization
+
+We will use the first 26 batch-corrected PCs to construct the shared nearest-neighbor graph and compute the cell clusters using a resolution that will result in a UMAP clustering pattern that preserves the presence of the HSC and platelet clusters as we have identified previously. We will then use the identified clusters to plot the UMAP labeled by the cluster number for subsequent cluster cell-type annotation.
+
+```{r res_clust}
+# construct shared nearest-neighbor graph for clustering
+sc_obj = FindNeighbors(sc_obj, dims = 1:26, reduction = "harmony")
+
+# compute clusters using Louvain algorithm; found resolution = 0.01 gives 8 communities
+sc_obj = FindClusters(sc_obj, resolution = 0.01, algorithm = 1, random.seed = 0)
+
+# fetch and set the Seurat object's clusters with the feature "RNA_snn_res.0.01"
+Idents(sc_obj) = "RNA_snn_res.0.01"
+
+# plot UMAP with labeled clusters
+DimPlot(sc_obj, label = TRUE, group.by = "RNA_snn_res.0.01", reduction = "umap_harmony")
+
+# re-assess for platelets and HSCs
+FeaturePlot(sc_obj, features = platelet_hsc_markers, reduction = "umap_harmony", label = TRUE) & NoLegend()
+```
+
+By iteratively tuning the resolution using the Louvain algorithm for finding clusters, we find that a clustering resolution of 0.01 is needed to obtain 8 final clusters that label the two known cell-types (HSCs and platelets) well in our UMAP. With this data, we will proceed with the annotation of each cluster's cell-types based on their differential gene expression profiles.
+
+# Annotation of Cluster Cell-types
+
+To identify the cell-type associated with each computed cluster, we will first use Wilcoxon rank-sum test to identify the most highly expressed genes within each cluster, and utilize several references to manually associate the clusters with the cell types. We will additionally use Azimuth [2], which is a Shiny app that enables an automated annotation of cell-types based on the supplied data via reference-based mapping of the counts matrix, to refine our manually curated results.
+
+## Identification of Highly-expressed Marker Genes per Cluster
+
+First, we will identify the most highly expressed marker genes in each computed cluster as shown previously on the UMAP via Wilcoxon rank-sum test, store the top 10 markers per cluster, and use them to elucidate the cluster-associated cell-types.
+
+```{r marker_genes}
+# fetch and set the Seurat object's clusters with the feature "RNA_snn_res.0.01"
+Idents(sc_obj) = "RNA_snn_res.0.01"
+
+# use Wilcox test to get the top expressed marker genes using a log fold change threshold of 0.5
+marker_genes = FindAllMarkers(sc_obj, logfc.threshold = 0.5, test.use = "wilcox", only.pos = TRUE)
+
+# give each gene a rank within their cluster
+marker_genes = marker_genes %>%
+  group_by(cluster) %>%
+  mutate(annotation_rank = row_number()) %>%
+  ungroup()
+
+# get the top 10 marker genes for each cluster by log2-FC
+top10_marker_genes = marker_genes %>% 
+  group_by(cluster) %>% 
+  arrange(-avg_log2FC) %>% 
+  slice_head(n = 10) %>% 
+  ungroup()
+```
+
+We will write out the top 10 genes per cluster based on log2-fold change for the write-up.
+
+```{r write_out_dega, eval=TRUE}
+# wrangle the top 10 markers for writeup export
+top10_marker_genes %>%
+  select(gene, cluster) %>% 
+  mutate(row_id = rep(1:10, 8), 
+         cluster = str_c("Cluster ", cluster)) %>%
+  spread(cluster, gene) %>%
+  select(-row_id) %>% 
+  write_csv("top10_degenes_may5.csv")
+```
+
+## Annotation of Cluster-associated Cell-types
+
+In the paper by Tonglin et al., they identified 8 broad cell-type clusters and provided the top 10 marker genes for all but the T and NK cells and platelets [1]. We will leverage their findings, along with the previously defined HSC and platelet markers from the cell atlas used in Azimuth [2], to annotate the same cell-types within our self-analyzed dataset and cluster assignments below by plotting each of the defined vector of genes on the labeled clusters to the best of our ability. The 8 cell-types described by Tonglin et al. include: T and NK cells, Erythroid-like and erythroid precursor cells, Monocytes, B cells, HSC, Plasma cells, Neutrophils, and Platelets. [1] 
+
+It is worthy to note that Tonglin et al. listed three different cell cluster markers for the "Erythroid-like and erythroid precursor cells." In this case, we will attempt to annotate the erythroid-like and erythroid precursor cells to the best of our abilities using the marker genes from the original paper, but we expect to utilize Azimuth to supplement our annotation of these cell-types if needed.
+
+```{r plot_known_markers, fig.height=12, fig.width=6}
+# define all available top 10 marker genes for respective cell-types to annotate clusters [1]
+b_cell_markers = c("MS4A1", "TCL1A", "LINC00926", "FCER2", "CD19", "FCRL1", "FCRLA", "BLK", "LINC01857", "LINC02397")
+plasma_cell_markers = c("DERL3", "SDC1", "IGHG4", "JSRP1", "IGLL5", "FCRL5", "TNFRSF17", "SPAG4", "TXNDC5", "TNFRSF13B")
+monocyte_markers = c("LGALS2", "TMEM176A", "SLC7A7", "RBP7", "CD300E", "LRP1", "CD163", "TREM1", "NRG1", "HK3")
+neutrophil_markers = c("LCN2", "CMTM2", "S100P", "PROK2", "ANXA3", "CD177", "MCEMP1", "RETN", "PGLYRP1", "FOLR3")
+hsc_markers = c("SPINK2", "SOX4", "FAM30A", "CDK6", "AC084033.3", "SMIM24", "STMN1", "PRSS57", "MEF2C", "IGLL1")
+
+# note: cluster "Erythroid-like and erythroid precursor cells" are segregated into three clusters by the authors
+erythroblast_c6 = c("SELENBP", "IFIT1B", "GMPR", "IFI27", "DMTN", "KRT1", "PHOSPHO1", "AC130456.3", "PDZK1IP1", "TMCC2", "LINC00570")
+erythroblast_c9 = c("SPTA1", "SOX6", "YPEL4", "TSPO2", "ANKRD9", "FHDC1", "FRMD4A", "HEPACAM2", "AC100835.2", "SLFN14")
+erythroblast_c12 = c("AQP1", "HJURP", "A4GALT", "TMEM233", "PBK", "SKA1", "CA3", "CCDC68", "SLC25A21", "KREMEN1")
+
+colored_plot = DimPlot(sc_obj, label = TRUE, group.by = "RNA_snn_res.0.01", reduction = "umap_harmony") & NoLegend()
+
+colored_plot
+
+FeaturePlot(sc_obj, b_cell_markers, # cluster = 3
+            reduction = "umap_harmony", 
+            label = TRUE, ncol = 2, repel = TRUE) & NoLegend()
+
+FeaturePlot(sc_obj, plasma_cell_markers, # cluster = 4
+            reduction = "umap_harmony", 
+            label = TRUE, ncol = 2, repel = TRUE) & NoLegend()
+
+FeaturePlot(sc_obj, monocyte_markers, # cluster = 2?
+            reduction = "umap_harmony", 
+            label = TRUE, ncol = 2, repel = TRUE) & NoLegend()
+
+FeaturePlot(sc_obj, neutrophil_markers, # cluster = 2?
+            reduction = "umap_harmony", 
+            label = TRUE, ncol = 2, repel = TRUE) & NoLegend()
+
+FeaturePlot(sc_obj, hsc_markers, # cluster = 1
+            reduction = "umap_harmony", 
+            label = TRUE, ncol = 2, repel = TRUE) & NoLegend()
+
+FeaturePlot(sc_obj, platelet_markers, # cluster = 6
+            reduction = "umap_harmony", 
+            label = TRUE, ncol = 2, repel = TRUE) & NoLegend()
+
+FeaturePlot(sc_obj, erythroblast_c6, # cluster = 1?
+            reduction = "umap_harmony", 
+            label = TRUE, ncol = 2, repel = TRUE) & NoLegend()
+
+FeaturePlot(sc_obj, erythroblast_c9, # cluster = 1?
+            reduction = "umap_harmony", 
+            label = TRUE, ncol = 2, repel = TRUE) & NoLegend()
+
+FeaturePlot(sc_obj, erythroblast_c12, # cluster = 1?
+            reduction = "umap_harmony", 
+            label = TRUE, ncol = 2, repel = TRUE) & NoLegend()
+```
+
+Using the above visual annotation approach we have determined the following:
+
+* Cluster 0: _not found_
+
+* Cluster 1: HSC
+
+* Cluster 2: monocytes/neutrophils
+
+* Cluster 3: B cells
+
+* Cluster 4: Plasma cells
+
+* Cluster 5: _not found_
+
+* Cluster 6: Platelets
+
+* Cluster 7: _not found_
+
+Next, we will take an alternative approach to use the defined marker genes from literature as separate vectors and search through all computed marker genes to match as many clusters among the 8 clusters as possible.
+
+```{r match_known_markers}
+ident_markers = marker_genes[marker_genes$gene %in% b_cell_markers, ] %>%  # cluster 3
+  mutate(annotation_cell_type = "b_cell")
+
+ident_markers = marker_genes[marker_genes$gene %in% plasma_cell_markers, ] %>%  # cluster 4
+  mutate(annotation_cell_type = "plasma_cell") %>% 
+  rbind(ident_markers)
+
+ident_markers = marker_genes[marker_genes$gene %in% monocyte_markers, ] %>%  # cluster 2
+  mutate(annotation_cell_type = "monocyte") %>% 
+  rbind(ident_markers)
+
+ident_markers = marker_genes[marker_genes$gene %in% neutrophil_markers, ] %>%  # cluster 2
+  mutate(annotation_cell_type = "neutrophil") %>% 
+  rbind(ident_markers)
+
+ident_markers = marker_genes[marker_genes$gene %in% hsc_markers, ] %>%  # cluster 1
+  mutate(annotation_cell_type = "hsc") %>% 
+  rbind(ident_markers)
+  
+ident_markers = marker_genes[marker_genes$gene %in% erythroblast_c6, ] %>%  # cluster 1
+  mutate(annotation_cell_type = "erythroblast_c6") %>% 
+  rbind(ident_markers)
+  
+ident_markers = marker_genes[marker_genes$gene %in% erythroblast_c9, ] %>%  # cluster 1
+  mutate(annotation_cell_type = "erythroblast_c9") %>% 
+  rbind(ident_markers)
+
+ident_markers = marker_genes[marker_genes$gene %in% erythroblast_c12, ] %>%  # cluster 7
+  mutate(annotation_cell_type = "erythroblast_c12") %>% 
+  rbind(ident_markers)
+
+# number of genes by matched to a cell-type and cluster
+DT::datatable(ident_markers %>% 
+  count(annotation_cell_type, cluster, name = "n_genes_matched") %>% 
+  ungroup() %>% 
+  arrange(-n_genes_matched))
+```
+
+Based on the table shown above, we find that there are certain conflicts between the identified genes and clusters while a few clusters are very distinctly identifiable, such as B cells, plasma cells, and HSCs. Others remained unclear and would require the usage of other resources.
+
+## Automated Cluster Annotation via Azimuth Human Bone Marrow Reference-based Mapping
+
+Azimuth uses reference-based mapping to identify the cell-types based on the clusters by querying our dataset onto the human bone marrow reference atlas. [2] The authors of Azimuth curated a reference database of 297,627 bone marrow cells from 39 sample donors across 3 different studies and used their known or predicted labels for assignment on our counts matrix. [2-5]
+
+We will first write-out the current state of the Seurat object for upload to Azimuth.
+
+```{r save_azimuth, eval=FALSE}
+saveRDS(sc_obj, "sc_obj_project.rds") # save the Seurat object for upload to Azimuth
+```
+
+Now that we have obtained the output from Azimuth, we will add the Azimuth results to our Seurat object and obtain the annotated clusters and associated marker gene data for subsequent analyses.
+
+```{r read_azimuth}
+sc_obj = AddAzimuthResults(sc_obj, "azimuth_out/azimuth_results.Rds") # add azimuth results into the Seurat object
+```
+
+We will first visualize the broad cell-type annotations that Azimuth produced (l1), using clusters from both our own analysis and Azimuth's algorithm.
+
+```{r viz_azimuth_l1, fig.asp=1.15}
+# plot the predicted cell-types (l1) using Azimuth generated UMAP and our UMAP
+azimuth_umap_l1 = (DimPlot(sc_obj, label = TRUE, group.by = "predicted.celltype.l1", 
+          reduction = "umap.proj", label.size = 3, repel = TRUE) +
+    labs(title = "Azimuth Clustered UMAP and Predicted Cell-types (l1)")) +
+  plot_layout(guides = "keep") &
+  theme(legend.position = "none",
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        plot.title = element_text(size = 8))
+
+azimuth_umap_l1 /
+  ((DimPlot(sc_obj, label = TRUE, group.by = "RNA_snn_res.0.01",
+           reduction = "umap_harmony", label.size = 3) +
+     labs(title = "Our Clustered UMAP and the Original Cluster Numbers")) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom", legend.text = element_text(size = 7),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        plot.title = element_text(size = 8)) |
+(DimPlot(sc_obj, label = TRUE, group.by = "predicted.celltype.l1", 
+         reduction = "umap_harmony", label.size = 3, repel = TRUE) +
+    labs(title = "Our Clustered UMAP and Azimuth Predicted Cell-types (l1)")) +
+  plot_layout(guides = "keep") &
+  theme(legend.position = "none",
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        plot.title = element_text(size = 8)))
+```
+
+Based on the visualized Azimuth's broad cell-type annotations, we can update our previous list of annotations. The latest cluster assignments are in *bold* as listed below:
+
+* Cluster 0: _not found_ -> *T and NK cells*
+
+* Cluster 1: *HSC/HSPC*
+
+* Cluster 2: monocytes/neutrophils -> *monocytes*
+
+* Cluster 3: *B cells*
+
+* Cluster 4: Plasma cells -> *Other*
+
+* Cluster 5: _not found_ -> *DCs*
+
+* Cluster 6: Platelets -> *DCs*
+
+* Cluster 7: _not found_ -> *monocytes*
+
+Next, we will examine these further using the more granular l2 annotations from Azimuth.
+
+```{r viz_azimuth_l2, fig.asp=1.15}
+# plot the predicted cell-types (l2) using Azimuth generated UMAP and our UMAP
+azimuth_umap_l2 = (DimPlot(sc_obj, label = TRUE, group.by = "predicted.celltype.l2", 
+          reduction = "umap.proj", label.size = 3, repel = TRUE) +
+    labs(title = "Azimuth Clustered UMAP and Predicted Cell-types (l2)")) +
+  plot_layout(guides = "keep") &
+  theme(legend.position = "none",
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        plot.title = element_text(size = 8))
+
+azimuth_umap_l2 /
+  ((DimPlot(sc_obj, label = TRUE, group.by = "RNA_snn_res.0.01",
+           reduction = "umap_harmony", label.size = 3) +
+     labs(title = "Our Clustered UMAP and the Original Cluster Numbers")) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom", legend.text = element_text(size = 7),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        plot.title = element_text(size = 8)) |
+(DimPlot(sc_obj, label = TRUE, group.by = "predicted.celltype.l2", 
+         reduction = "umap_harmony", label.size = 3, repel = TRUE) +
+    labs(title = "Our Clustered UMAP and Azimuth Predicted Cell-types (l2)")) +
+  plot_layout(guides = "keep") &
+  theme(legend.position = "none",
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        plot.title = element_text(size = 8)))
+```
+
+Using the information from above, we can update our list of annotations again with more detailed information. The lastest annotations are shown in *bold* below:
+
+* Cluster 0: _not found_ -> *T and NK cells*
+
+* Cluster 1: HSC/HSPC -> *HSC, erythroid-like, and erythroid precursor cells* -> *HSPC* (generalized)
+
+* Cluster 2: monocytes/neutrophils -> *monocytes*
+
+* Cluster 3: *B cells*
+
+* Cluster 4: Plasma cells -> Other -> *plasma cells*
+
+* Cluster 5: _not found_ -> *DC*
+
+* Cluster 6: Platelets -> DCs -> *platelets*
+
+* Cluster 7: _not found_ -> monocytes -> *stromal cells*
+
+Using the l2 reference annotations from Azimuth, we have completed our cluster annotations as shown above. We will update our Seurat object to include the new cluster annotations. Note here that we agglomerate the erythroid-like and erythoid precursor cells cell-type together with HSCs and call them hematopoietic stem and progenitor cells (HSPCs) since the erythroid-like and erythoid precursor cells include cells that are at early stages of differentiation.
+
+```{r set_new_ident}
+c_types = c("TandNK", "HSPC", "monocytes", "B", "plasma", "DC", "platelets", "stromal")
+
+names(c_types) = levels(sc_obj)
+
+sc_obj = RenameIdents(sc_obj, c_types)
+
+sc_obj@meta.data = sc_obj@meta.data %>% 
+  merge(data.frame(c_types = Idents(sc_obj)), by = "row.names") %>% 
+  column_to_rownames("Row.names")
+
+DimPlot(sc_obj, reduction = "umap_harmony", label = TRUE) & NoLegend()
+```
+
+# Downstream Analyses
+
+In our downstream analyses, we will first perform a differential abundance analysis between AA and non-AA controls for each of the annotated clusters to better understand the differences in terms of cell-type distributions in bone marrow tissue between AA and non-AA controls; subsequently, we will perform differential gene expression analysis together with gene set enrichment analysis for B cells in AA samples, which may help us further our understanding of the biomolecular associations of B cells in AA through scRNA-seq analysis.
+
+## Differential Abundance Analysis between Annotated Clusters
+
+We will begin by visualizing the proportion of cell-types for each disease, then also show the proportion of cell-types for each sample that is stratified by disease status.
+
+```{r prop_cells_l1}
+((sc_obj@meta.data %>% 
+  ggplot() +
+  geom_bar(aes(x = sample, fill = c_types), position = "fill") +
+  facet_grid(~disease, scales = "free") +
+  scale_fill_viridis(discrete = TRUE) +
+  theme_bw() +
+  labs(x = "Sample", y = "Proportion of Cell-types", fill = "Cell-types")) | 
+  (sc_obj@meta.data %>% 
+     ggplot() +
+     geom_bar(aes(x = disease, fill = c_types), position = "fill") +
+     scale_fill_viridis(discrete = TRUE) +
+     theme_bw() +
+     labs(x = "Disease Status", y = "Proportion of Cell-types", fill = "Cell-types"))) +
+  plot_layout(guides = "collect")
+```
+
+Next, we will perform Wilcoxon rank-sum tests for each cell-type between cases and controls to assess whether any of the cell-types are different in proportion between AA and non-AA samples. We will adjust the resulting p-values using the Benjamini-Hochberg (BH) method to account for multiplicity in hypothesis testing. It is worthy to note here, that since we only have n = 2 samples per each disease group, conducting a hypothesis test here is less meaningful due to the low sample size. As such, we will visualize the proportion of cell-types between cases and controls to provide a qualitative comparison of the differential abundances in cell-types between the cases and controls.
+
+```{r wrangle_counts}
+DA_disease = sc_obj@meta.data %>% 
+  group_by(disease, sample) %>% 
+  summarise(TandNK_prop = sum(c_types == "TandNK")/n(),
+            HSPC_prop = sum(c_types == "HSPC")/n(),
+            monocytes_prop = sum(c_types == "monocytes")/n(),
+            B_prop = sum(c_types == "B")/n(),
+            plasma_prop = sum(c_types == "plasma")/n(),
+            DC_prop = sum(c_types == "DC")/n(),
+            platelets_prop = sum(c_types == "platelets")/n(),
+            stromal_prop = sum(c_types == "stromal")/n()) %>% 
+  ungroup()
+
+# get all cell cluster column names
+c_type_cols = DA_disease %>% 
+  select(-c(disease, sample)) %>% 
+  colnames()
+
+# run Wilcoxon rank-sum test for each cluster between cases and control samples
+wilcox_output = data.frame(p_value = sapply(c_type_cols, function(x){
+  result = wilcox.test(eval(as.name(x)) ~ disease, data = DA_disease)
+  result$p.value
+  })) %>% 
+  rownames_to_column(var = "cell_type") %>% 
+  mutate(p_value.adj = p.adjust(p_value, method = "BH"),
+         cell_type = cell_type %>% str_remove("_prop"),
+         p_value = signif(p_value, 3),
+         p_value.adj = signif(p_value.adj, 3)) %>% 
+  arrange(p_value)
+
+DT::datatable(wilcox_output)
+```
+
+```{r cell_prop_viz}
+sc_obj@meta.data %>% 
+  group_by(disease) %>% 
+  summarise(TandNK = sum(c_types == "TandNK")/n(),
+            HSPC = sum(c_types == "HSPC")/n(),
+            monocytes = sum(c_types == "monocytes")/n(),
+            B = sum(c_types == "B")/n(),
+            plasma = sum(c_types == "plasma")/n(),
+            DC = sum(c_types == "DC")/n(),
+            platelets = sum(c_types == "platelets")/n(),
+            stromal = sum(c_types == "stromal")/n()) %>% 
+  ungroup() %>% 
+  pivot_longer(cols = c(TandNK:stromal), names_to = "cell_type", values_to = "prop_cells") %>% 
+  ggplot() +
+  geom_bar(aes(x = cell_type, y = prop_cells, fill = disease), 
+           stat = "identity", position = "dodge") +
+  theme_bw() +
+  labs(x = "Cell-type", y = "Proportion of Cells (%)", fill = "Disease Status") +
+  scale_y_continuous(labels = scales::percent)
+```
+
+Using a significance threshold of $\alpha=0.05$ for the adjusted p-value, we see that none of the cell-types are significantly different in median. However, we can infer based on our visualization that AA patients have lower proportions of HSPCs and monocytes and higher proportions of plasma cells and T and NK cells relative to the non-AA group. In AA, findings of lower proportions of HSPCs relative to non-AA individuals are expected and consistent with literature [1]. Furthermore, high proportions of T and NK cells in AA have been described in literature, as abnormal activation of immune cells have been observed in AA [1]. Therefore, based on the current differential abundance analysis, we have qualitatively demonstrated that our results provide confirmatory evidence with the findings in literature regarding the cell-type abundances in AA bone marrow tissue, which also provides validity to our analytical approach.
+
+```{r save_checkpt, eval=FALSE}
+saveRDS(sc_obj, "sc_obj_project_checkpoint0.rds")
+sc_obj = readRDS("sc_obj_project_checkpoint0.rds")
+```
+
+
+## Differential Gene Expression within B-cells
+
+In our second analysis, we will perform differential gene expression analysis (DGEA) on B cells in the AA group using a one-against-all approach (i.e., comparing B cells to all other cell-types) and perform gene set enrichment analysis using MSigDB to load the human Gene Ontology (GO) database [7] to further understand the differentially expressed genes in B cells and their relationship to biological, cellular, and molecular functions. In this case, B cells were selected for analysis due to its relevance to AA pathogenesis, as addressed in Tonglin et al. (2022) [1] in hopes of furthering our understanding of the gene-level contributions of B cells to the pathophysiology of AA. 
+
+### Differential Gene Expression Analysis and Visualization
+
+Below, we will use the Wilcoxon rank-sum test to perform DGEA, which is a simple and common approach for conducting DGEA and is less computationally expensive relative to more complex algorithms. Furthermore, we will use $\alpha=0.05$ as a significance threshold for screening differentially expressed genes.
+
+```{r DGEA}
+# scale genes
+sc_obj = ScaleData(sc_obj, features = rownames(sc_obj), assay = "RNA")
+
+Idents(sc_obj) = "disease" # change identity to disease for DGEA
+
+# perform DGEA for B cells in AA group
+dgea_output_AA = FindMarkers(sc_obj, ident.1 = "B",
+                        verbose = TRUE, group.by = "c_types", subset.ident = "anemia",
+                        logfc.threshold = 0.5, test.use = "wilcox", only.pos = FALSE)
+
+# filter out non-signif genes
+dgea_output_AA = dgea_output_AA %>% filter(p_val_adj < 0.05)
+
+# get top 10 DE genes based on largest avg log2-FC
+dgea_top10_genes_AA = row.names(dgea_output_AA %>% arrange(-avg_log2FC) %>% slice_head(n = 10))
+
+# plot heatmap
+DoHeatmap(sc_obj, features = dgea_top10_genes_AA, size = 3, group.by = "disease") + 
+  ggtitle("Top 10 Differentially Expressed Genes in B-cells")
+```
+
+### Gene Set Enrichment Analysis using GO Annotations
+
+After identifying the differentially expressed genes in B cells, we will load the human Gene Ontology annotations, which contains various biological, cellular, and molecular functions and pathways [7], and subsequently annotate the top 5 genes ranked by the normalized enrichment score (NES) from fgsea to elucidate the function of B cell genes in AA.
+
+```{r fgsea}
+# get the significant genes from DGEA and rank by largest avg log2FC
+b_genes = dgea_output_AA %>% 
+  rownames_to_column(var = "gene") %>% 
+  arrange(-avg_log2FC) %>% 
+  filter(p_val_adj < 0.05) %>% 
+  select(gene, avg_log2FC) %>% 
+  deframe()
+
+# load the GO database
+go_pathways = msigdbr(species = "Homo sapiens", category = "C5")
+
+# split the data from the GO database for use in fgsea
+go_list = split(x = go_pathways$gene_symbol, f = go_pathways$gs_name)
+
+# run fgsea to get significantly enriched genes
+fgsea_b_cells = fgsea(pathways = go_list, stats = b_genes)
+
+# get top 5 annotations
+fgsea_b_cells %>% 
+  arrange(-NES) %>% 
+  select(pathway) %>% 
+  slice_head(n = 5)
+```
+
+Interestingly, we find that the top 5 enriched genes are associated with two human phenotypes cough and meningitis, two molecular functions associated with MHC class II protein complex binding and MHC protein complex binding, and one biological pathway associated with the production of molecular mediator of immune response. Aside from the two human phenotypes, the two molecular functions associated with MHC protein complex binding, specifically MHC class II protein complexes, are directly related to the function of B cells as they are the major regulators of B cells during an immune response [8]; this also explains the biological pathway of these genes participating in the production of molecular mediators of immune response.
+
+# References
+
+[1] Tonglin H, Yanna Z, Xiaoling Y, Ruilan G, Liming Y. Single-Cell RNA-Seq of Bone Marrow Cells in Aplastic Anemia. Front Genet. 2022;12:745483. Published 2022 Jan 3. doi:10.3389/fgene.2021.745483
+
+[2] Hao Y, Hao S, Andersen-Nissen E, et al. Integrated analysis of multimodal single-cell data. Cell. 2021;184(13):3573-3587.e29. doi:10.1016/j.cell.2021.04.048
+
+[3] Oetjen KA, Lindblad KE, Goswami M, et al. Human bone marrow assessment by single-cell RNA sequencing, mass cytometry, and flow cytometry. JCI Insight. 12 2018;3(23). doi:10.1172/jci.insight.124928
+
+[4] Granja, J.M., Klemm, S., McGinnis, L.M. et al. Single-cell multiomic analysis identifies regulatory programs in mixed-phenotype acute leukemia. Nat Biotechnol 37, 1458–1465 (2019). https://doi.org/10.1038/s41587-019-0332-7
+
+[5] [Human Cell Atlas Immune Cell Census](https://data.humancellatlas.org/explore/projects/cc95ff89-2e68-4a08-a234-480eca21ce79)
+
+[6] Fagerberg L, Hallström BM, Oksvold P, et al. Analysis of the human tissue-specific expression by genome-wide integration of transcriptomics and antibody-based proteomics. Mol Cell Proteomics. 2014;13(2):397-406. doi:10.1074/mcp.M113.035600
+
+[7] Mi H, Huang X, Muruganujan A, Tang H, Mills C, Kang D, Thomas PD. PANTHER version 14: more genomes, a new PANTHER GO-slim and improvements in enrichment analysis tools. Nucleic Acids Res. Jan 2019;47(D1):D419-D426.
+
+[8] Katikaneni DS, Jin L. B cell MHC class II signaling: A story of life and death. Hum Immunol. 2019;80(1):37-43. doi:10.1016/j.humimm.2018.04.013
